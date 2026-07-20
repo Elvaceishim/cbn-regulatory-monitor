@@ -1,158 +1,209 @@
 # CBN Regulatory Monitor
 
-## The Problem
+## Overview
 
-The Central Bank of Nigeria publishes circulars and press releases that can materially affect banks, fintechs, payment companies, and compliance teams.
+The Central Bank of Nigeria publishes circulars, regulatory guidance, and 
+press releases that can materially affect banks, fintechs, payment 
+companies, and compliance teams.
 
-The challenge is that these updates are published on web pages rather than through a public API. Monitoring them manually means repeatedly checking multiple pages and hoping nothing important is missed.
+The problem is that these updates are published on web pages rather than 
+through a public API. Monitoring them manually means repeatedly checking 
+multiple pages and hoping nothing important is missed.
 
-I built an automated monitoring system that checks the CBN website daily, detects newly published documents, stores them in a database, and sends alerts only when genuinely new regulatory content appears.
+This project automates that process.
 
-## What This Project Does
+A scheduled n8n workflow calls a FastAPI scraper service, collects newly 
+published CBN documents, stores them in PostgreSQL, prevents duplicate 
+processing, and sends Telegram alerts only when genuinely new regulatory 
+content appears.
 
-- Scrapes CBN Circulars and Press Releases
-- Detects newly published documents
-- Stores documents in Postgres
-- Prevents duplicate processing
-- Sends Telegram alerts for new documents
-- Maintains an audit trail of processed records
-- Records failures in a dead-letter table for investigation
+---
+
+## Features
+
+- Automated monitoring of CBN Circulars
+- Automated monitoring of CBN Press Releases
+- Playwright-powered scraping
+- PostgreSQL-backed deduplication
+- Audit trail for all discovered documents
+- Dead-letter table for failed processing
+- Telegram alert delivery
+- Idempotent workflow execution
+
+---
 
 ## Architecture
 
 ```text
-Daily Trigger (n8n)
+n8n Schedule Trigger
         │
         ▼
 FastAPI Scraper Service
         │
         ▼
-Playwright
+Playwright Scraper
         │
         ▼
 CBN Website
         │
         ▼
-Postgres
-        │
-        ├── Deduplication
-        ├── Audit Trail
-        └── Dead Letter Queue
+PostgreSQL
+   ├─ Deduplication
+   ├─ Audit Trail
+   └─ Dead Letter Queue
         │
         ▼
 Telegram Alerts
+```
 
-Tech Stack
-n8n
-Python
-FastAPI
-Playwright
-PostgreSQL
-Docker Compose
-Telegram Bot API
-Database Design
-cbn_documents
+---
 
-Stores every processed document.
+## Tech Stack
 
-Column	Purpose
-id	Primary key
-url	Unique document URL
-title	Document title
-sources	Source metadata
-first_seen_at	First discovery timestamp
-notified_at	Alert timestamp
+| Component | Technology |
+|------------|------------|
+| Workflow Orchestration | n8n |
+| API Service | FastAPI |
+| Scraping | Playwright |
+| Database | PostgreSQL |
+| Containerization | Docker Compose |
+| Notifications | Telegram Bot API |
 
-Deduplication is enforced with a database-level UNIQUE constraint on url.
+---
 
-cbn_dead_letter
+## Database Design
 
-Stores failed processing attempts for investigation and replay.
+### `cbn_documents`
 
-Testing Results
-Test	Result
-Live scraping	Passed
-FastAPI integration	Passed
-Postgres persistence	Passed
-Telegram alerts	Passed
-Telegram message chunking	Passed
-Deduplication	Passed
-End-to-end workflow	Passed
-Idempotency test	Passed
-Dataset
-Documents discovered: 22
-Documents inserted: 22
-Duplicate URLs detected: 0
-Idempotency Verification
+Stores all processed regulatory documents.
+
+| Column | Description |
+|----------|----------|
+| id | Primary key |
+| url | Unique document URL |
+| title | Document title |
+| sources | Source metadata |
+| first_seen_at | Discovery timestamp |
+| notified_at | Alert timestamp |
+
+Deduplication is enforced through a database-level UNIQUE constraint on 
+document URLs.
+
+### `cbn_dead_letter`
+
+Stores failed processing attempts for later investigation and replay.
+
+---
+
+## Testing Results
+
+| Test | Status |
+|--------|--------|
+| Live Scraping | ✅ Passed |
+| FastAPI Integration | ✅ Passed |
+| PostgreSQL Persistence | ✅ Passed |
+| Telegram Alerts | ✅ Passed |
+| Message Chunking | ✅ Passed |
+| Deduplication | ✅ Passed |
+| End-to-End Workflow | ✅ Passed |
+| Idempotency Verification | ✅ Passed |
+
+### Dataset
+
+- Documents discovered: **22**
+- Documents inserted: **22**
+- Duplicate URLs detected: **0**
+
+### Idempotency Verification
 
 The workflow was executed twice against the same live dataset.
 
-Before rerun
+**Before rerun**
 
+```
 22 documents
+```
 
-After rerun
+**After rerun**
 
+```
 22 documents
+```
 
 Results:
 
-No new database records created
-No duplicate alerts sent
-No duplicate URLs detected
+- No new database records created
+- No duplicate alerts sent
+- No duplicate URLs detected
 
-This confirms the workflow can safely run on a schedule without repeatedly processing existing documents.
+This confirms the workflow can safely run on a schedule without repeatedly 
+processing existing records.
 
-What Broke During Development
+---
 
-This project turned out to be the most infrastructure-heavy automation project in the portfolio.
+## What Broke During Development
 
-1. Docker Storage Corruption
+This project had more infrastructure debugging than either of my previous 
+automation projects.
 
-Docker builds repeatedly failed despite sufficient host disk space.
+### Docker Storage Corruption
 
-Investigation showed Docker Desktop's internal storage state had become inconsistent.
+Docker builds repeatedly failed despite sufficient available disk space.
+
+Root cause: Docker Desktop's internal storage state became inconsistent.
 
 Resolution:
 
-Docker cleanup
-Builder cache removal
-Docker Desktop restart
-Fresh image pulls
-2. Playwright Timing Issues
+- Cleared builder cache
+- Pruned Docker resources
+- Restarted Docker Desktop
+- Pulled fresh images
+
+### Playwright Timing Issues
 
 The CBN pages load content asynchronously.
 
-Initial scraper implementations occasionally returned incomplete results because extraction began before page content finished loading.
+Initial scraper runs occasionally returned incomplete results because 
+extraction started before page content had fully loaded.
 
 Resolution:
 
-Added explicit waits
-Improved page readiness checks
-Re-tested against live pages
-3. Telegram Message Length Limit
+- Added explicit waits
+- Added page readiness checks
+- Re-tested against live pages
 
-The first successful run attempted to send all discovered documents in a single Telegram message.
+### Telegram Message Limit
 
-Telegram rejected the request because messages exceeded the 4096-character limit.
+The first successful run attempted to send all discovered documents in a 
+single Telegram message.
+
+Telegram rejected the request because the message exceeded its 
+4096-character limit.
 
 Resolution:
 
-Implemented message chunking
-Split large alert batches into multiple messages
-4. n8n Type Coercion Bug
+- Implemented message chunking
+- Split alerts across multiple Telegram messages
 
-The workflow's "Is New?" decision node appeared correctly configured but did not route items as expected.
+### n8n Type Coercion Bug
+
+The workflow's "Is New?" decision node appeared correctly configured but 
+refused to route items as expected.
 
 Root cause:
 
-A data-type mismatch between values being evaluated
+A data type mismatch between values being compared.
 
 Resolution:
 
-Normalized data types before evaluation
-Verified branch behavior using real execution data
-Project Structure
+- Normalized data types before evaluation
+- Verified routing behavior using real execution data
+
+---
+
+## Project Structure
+
+```text
 cbn-regulatory-monitor/
 ├── db/
 │   └── init.sql
@@ -166,15 +217,26 @@ cbn-regulatory-monitor/
 ├── docker-compose.yml
 ├── .env.example
 └── README.md
-Future Improvements
-Email alerts
-Slack integration
-Historical change tracking
-Document classification
-Regulatory topic tagging
-Dashboard for monitoring trends
-Key Takeaway
+```
 
-This project wasn't built to demonstrate web scraping.
+---
 
-It was built to demonstrate how to design and operate a production-shaped monitoring workflow: collecting data from a source with no API, handling failures, preventing duplicate processing, and delivering alerts only when action is required.
+## Future Improvements
+
+- Email notifications
+- Slack integration
+- Historical change tracking
+- Document classification
+- Regulatory topic tagging
+- Monitoring dashboard
+
+---
+
+## Key Takeaway
+
+This project was not built to demonstrate web scraping.
+
+It was built to demonstrate how to design and operate a production-style 
+monitoring workflow: collecting data from a source with no public API, 
+handling failures, preventing duplicate processing, and delivering alerts 
+only when action is required.
