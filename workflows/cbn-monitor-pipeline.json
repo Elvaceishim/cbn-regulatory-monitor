@@ -1,0 +1,170 @@
+{
+  "name": "CBN Monitor Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "0 8 * * *" }
+          ]
+        }
+      },
+      "name": "Daily Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [ -800, 0 ],
+      "id": "trigger-node-01"
+    },
+    {
+      "parameters": {
+        "url": "http://cbn-scraper:8000/check",
+        "options": { "timeout": 60000 }
+      },
+      "name": "Check CBN Updates",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [ -600, 0 ],
+      "id": "http-node-check",
+      "notes": "The scraper itself waits for content to stabilize (can take 15-30s per page), so this node needs a generous timeout — 60s, not the default.",
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO cbn_dead_letter (error_message) VALUES ('{{ ((($json.error || $json.message || JSON.stringify($json)) + \"\").toString().replace(/'/g, \"''\")) }}');",
+        "options": {}
+      },
+      "name": "Log Scrape Failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [ -600, 200 ],
+      "id": "pg-node-dead-letter",
+      "credentials": { "postgres": { "id": "1", "name": "Local Postgres" } }
+    },
+    {
+      "parameters": {
+        "jsonCode": "// Splits the single API response's items array into one n8n item\n// per document, so the Postgres node can process each independently.\nconst items = $json.items || [];\nreturn items.map(item => ({ json: item }));"
+      },
+      "name": "Flatten Items",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ -400, 0 ],
+      "id": "code-node-flatten"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO cbn_documents (url, title, sources)\nVALUES (\n  '{{ $json.url.replace(/'/g, \"''\") }}',\n  '{{ $json.title.replace(/'/g, \"''\") }}',\n  '{{ JSON.stringify($json.sources).replace(/'/g, \"''\") }}'::jsonb\n)\nON CONFLICT (url) DO NOTHING\nRETURNING id, url, title, sources;",
+        "options": {}
+      },
+      "name": "Upsert Documents",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [ -200, 0 ],
+      "id": "pg-node-upsert",
+      "notes": "Query Batching MUST be set to Independent (Options > Query Batching), or every item gets merged into one opaque batch call and you lose per-item RETURNING data — this exact bug cost real debugging time in Project 1.",
+      "credentials": { "postgres": { "id": "1", "name": "Local Postgres" } },
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "leftValue": "={{ ($json.id || '').toString() }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "notEmpty" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "name": "Is New?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [ 0, 0 ],
+      "id": "if-node-isnew",
+      "notes": "A real 'id' means the INSERT actually happened (genuinely new document). A conflict (already seen) returns no RETURNING data, so id will be empty on that branch."
+    },
+    {
+      "parameters": {
+        "jsonCode": "// Chunks new documents into multiple messages if needed, rather than\n// risking one oversized message — Telegram rejects anything over 4096\n// characters, which the very first run (everything is 'new') will hit\n// even though normal daily runs (0-3 new items) never would.\nconst items = $input.all().map(i => i.json);\nif (items.length === 0) return [];\n\nconst MAX_CHARS = 3500; // safety margin under Telegram's 4096 limit\nconst chunks = [];\nlet currentLines = [];\nlet currentLength = 0;\n\nfor (const item of items) {\n  const line = `📄 ${item.title}\\n${item.url}`;\n  if (currentLength + line.length + 2 > MAX_CHARS && currentLines.length > 0) {\n    chunks.push(currentLines);\n    currentLines = [];\n    currentLength = 0;\n  }\n  currentLines.push(line);\n  currentLength += line.length + 2;\n}\nif (currentLines.length > 0) chunks.push(currentLines);\n\nreturn chunks.map((lines, idx) => {\n  const header = chunks.length > 1\n    ? `New CBN publications (part ${idx + 1}/${chunks.length}):\\n\\n`\n    : `New CBN publication${items.length > 1 ? 's' : ''} (${items.length}):\\n\\n`;\n  return { json: { text: header + lines.join('\\n\\n') } };\n});"
+      },
+      "name": "Build Alert Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ 200, -100 ],
+      "id": "code-node-alert"
+    },
+    {
+      "parameters": {
+        "jsonCode": "// Separate branch, decoupled from Telegram sending entirely — collects\n// every new document's id into one item, regardless of how many chunks\n// the alert message above got split into. This sidesteps the exact\n// cross-node reference problem we hit in Project 2 (a node downstream\n// of Telegram can't reliably read pre-Telegram data), by simply not\n// routing through Telegram at all for this step.\nconst items = $input.all().map(i => i.json);\nreturn [{ json: { ids: items.map(i => i.id) } }];"
+      },
+      "name": "Collect All New IDs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ 200, 100 ],
+      "id": "code-node-collect-ids"
+    },
+    {
+      "parameters": {
+        "chatId": "REPLACE_WITH_YOUR_CHAT_ID",
+        "text": "={{$json.text}}",
+        "additionalFields": {}
+      },
+      "name": "Send CBN Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [ 400, -100 ],
+      "id": "telegram-node-alert",
+      "credentials": { "telegramApi": { "id": "3", "name": "Telegram account" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE cbn_documents\nSET notified_at = now()\nWHERE id = ANY(ARRAY[{{ $json.ids.join(',') }}]::int[]);",
+        "options": {}
+      },
+      "name": "Mark as Notified",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [ 600, 100 ],
+      "id": "pg-node-mark-notified",
+      "notes": "Sits downstream of 'Collect All New IDs', not Telegram — deliberately decoupled so this doesn't depend on Telegram succeeding, and so it can use plain $json.ids with no cross-node reference at all.",
+      "credentials": { "postgres": { "id": "1", "name": "Local Postgres" } }
+    }
+  ],
+  "connections": {
+    "Daily Trigger": { "main": [[{ "node": "Check CBN Updates", "type": "main", "index": 0 }]] },
+    "Check CBN Updates": {
+      "main": [
+        [{ "node": "Flatten Items", "type": "main", "index": 0 }],
+        [{ "node": "Log Scrape Failure", "type": "main", "index": 0 }]
+      ]
+    },
+    "Flatten Items": { "main": [[{ "node": "Upsert Documents", "type": "main", "index": 0 }]] },
+    "Upsert Documents": { "main": [[{ "node": "Is New?", "type": "main", "index": 0 }]] },
+    "Is New?": {
+      "main": [
+        [
+          { "node": "Build Alert Message", "type": "main", "index": 0 },
+          { "node": "Collect All New IDs", "type": "main", "index": 0 }
+        ],
+        []
+      ]
+    },
+    "Build Alert Message": { "main": [[{ "node": "Send CBN Alert", "type": "main", "index": 0 }]] },
+    "Collect All New IDs": { "main": [[{ "node": "Mark as Notified", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "pinData": {}
+}
